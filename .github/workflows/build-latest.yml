@@ -1,120 +1,66 @@
-name: 🍜 Build/publish all runners
+name: Build and scan all runners
 
 on:
-  workflow_dispatch: # build on demand
-  schedule:
-    - cron: "43 6 * * 0" # build every Sunday at 6:43 AM UTC
+ workflow_dispatch:
+ schedule:
+   - cron: "43 6 * * 0" # Every Sunday at 6:43 AM UTC
 
 jobs:
-  build-all:
-    runs-on: ubuntu-24.04-arm # use the GitHub-hosted ARM runner to build the image
-    permissions:
-      contents: write # for uploading the SBOM to the release
-      packages: write # for uploading the finished container
-      security-events: write # for github/codeql-action/upload-sarif to upload SARIF results
-      id-token: write # to complete the identity challenge with sigstore/fulcio when running outside of PRs
-      attestations: write # to create the attestations for the container
-      artifact-metadata: write # for writing the build attestations
-    strategy:
-      matrix:
-        os:
-          [
-            rootless-ubuntu-jammy,
-            rootless-ubuntu-numbat,
-            rootless-ubuntu-resolute,
-            ubi8,
-            ubi9,
-            ubi10,
-            wolfi,
-          ]
-    continue-on-error: true
+ build-all:
+   name: Scan ${{ matrix.os }} (${{ matrix.platform.arch }})
+   runs-on: ${{ matrix.platform.runner }}
+   permissions:
+     contents: read
+     security-events: write
+   strategy:
+     fail-fast: false
+     matrix:
+       os:
+         - rootless-ubuntu-jammy
+         - rootless-ubuntu-numbat
+         - rootless-ubuntu-resolute
+         - ubi8
+         - ubi9
+         - ubi10
+         - wolfi
+       platform:
+         - arch: amd64
+           runner: ubuntu-24.04
+         - arch: arm64
+           runner: ubuntu-24.04-arm
 
-    steps:
-      - name: Checkout the repo
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+   steps:
+     - name: Checkout the repo
+       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+       with:
+         persist-credentials: false
 
-      - name: Set version
-        run: echo "VERSION=$(cat ${GITHUB_EVENT_PATH} | jq -r '.release.tag_name')" >> $GITHUB_ENV
-        if: github.event_name == 'release'
+     - name: Set up Docker Buildx
+       uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
 
-      - name: Set short SHA
-        run: echo "SHA_SHORT=${GITHUB_SHA::7}" >> $GITHUB_ENV
+     - name: Build the local image
+       uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+       with:
+         context: .
+         file: ./images/${{ matrix.os }}.Dockerfile
+         platforms: linux/${{ matrix.platform.arch }}
+         tags: local/${{ matrix.os }}:${{ matrix.platform.arch }}
+         load: true
+         push: false
+         provenance: false
+         sbom: false
 
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+     - name: Scan the local image
+       uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+       id: scan
+       with:
+         image: "docker:local/${{ matrix.os }}:${{ matrix.platform.arch }}"
+         output-format: sarif
+         fail-build: false
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
-        with:
-          platforms: linux/amd64,linux/arm64
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
-
-      - name: Set Docker metadata
-        id: docker_meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        with:
-          images: ghcr.io/some-natalie/kubernoodles/${{ matrix.os }}
-          tags: |
-            type=sha,format=long
-            type=raw,value=${{ env.SHA_SHORT }}
-            type=raw,value=latest
-
-      - name: Build and push the containers
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        id: build-and-push
-        with:
-          file: ./images/${{ matrix.os }}.Dockerfile
-          push: false
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.docker_meta.outputs.tags }}
-
-      - name: Attest the build
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        id: attest
-        with:
-          subject-name: ghcr.io/some-natalie/kubernoodles/${{ matrix.os }}
-          subject-digest: ${{ steps.build-and-push.outputs.digest }}
-          push-to-registry: true
-
-      - name: Scan it
-        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
-        id: scan
-        with:
-          image: "ghcr.io/${{ github.repository }}/${{ matrix.os }}:${{ env.SHA_SHORT }}"
-          fail-build: false
-
-      - name: Upload the container scan report
-        id: upload
-        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v3.29.5
-        with:
-          sarif_file: ${{ steps.scan.outputs.sarif }}
-          wait-for-processing: true
-
-      - name: Generate that SBOM
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
-        with:
-          image: "ghcr.io/${{ github.repository }}/${{ matrix.os }}:${{ env.SHA_SHORT }}"
-          artifact-name: "${{ matrix.os }}-${{ matrix.arch }}-${{ env.SHA_SHORT }}.sbom"
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-
-      - name: Log in to GHCR
-        run: echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-
-      - name: Sign the images with GitHub OIDC Token
-        env:
-          DIGEST: ${{ steps.build-and-push.outputs.digest }}
-          TAGS: ${{ steps.docker_meta.outputs.tags }}
-        run: |
-          images=""
-          for tag in ${TAGS}; do
-            images+="${tag}@${DIGEST} "
-          done
-          cosign sign --yes ${images}
+     - name: Upload the container scan report
+       uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v3.29.5
+       with:
+         sarif_file: ${{ steps.scan.outputs.sarif }}
+         category: "image=${{ matrix.os }};platform=linux-${{ matrix.platform.arch }}"
+         wait-for-processing: true
