@@ -70,7 +70,7 @@ jobs:
         id: build-and-push
         with:
           file: ./images/${{ matrix.os }}.Dockerfile
-          push: true
+          push: false
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.docker_meta.outputs.tags }}
 
